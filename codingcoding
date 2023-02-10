@@ -1,0 +1,185 @@
+--unpaid/paid user by day
+
+with unpaid_user as  (SELECT date(TIMESTAMP_MICROS(event_timestamp)) as event_date, count(distinct user_pseudo_id) as all_active_unpaid_user
+FROM `remotetv-43875.analytics_332888339.events_*` where event_name in ('show_iap','close_iap','click_restore_iap') group by 1),
+new_sub as  (SELECT date(TIMESTAMP_MICROS(event_timestamp)) as event_date, count(distinct user_pseudo_id) as new_sub_user
+FROM `remotetv-43875.analytics_332888339.events_*` where event_name = 'in_app_purchase' group by 1)
+
+Select event_date,all_active_unpaid_user,new_sub.new_sub_user,round(new_sub.new_sub_user/all_active_unpaid_user,2) as new_sub_day
+from unpaid_user
+left join new_sub using(event_date)
+
+
+--tv category 
+Select user_pseudo_id,event_date,event_name,event_timestamp,event_params,
+        device.language,device.operating_system_version,device.mobile_model_name ,
+        geo.continent,geo.country,geo.city,
+        app_info.install_source,traffic_source.name,traffic_source.medium,traffic_source.source,
+        CONNECT_BY_FRIENDLY_NAME, CONNECT_BY_MODEL_NAME,CONNECT_BY_SERVICE,Paid_user,
+          Case when upper(CONNECT_BY_FRIENDLY_NAME) like '%SAMSUNG%' or upper(CONNECT_BY_MODEL_NAME) like '%SAMSUNG%' THEN 'SAMSUNG'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%LG%' or upper(CONNECT_BY_MODEL_NAME) like '%LG%' Then 'LG'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%TOSHIBA%' or upper(CONNECT_BY_MODEL_NAME) like '%TOSHIBA%' Then 'TOSHIBA'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%TCL%' or upper(CONNECT_BY_MODEL_NAME) like '%TCL%' Then 'TCL'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%SHARP%' or upper(CONNECT_BY_MODEL_NAME) like '%SHARP%' Then 'SHARP'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%PHILIPS%' or upper(CONNECT_BY_MODEL_NAME) like '%PHILIPS%' Then 'PHILIPS'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%HISENSE%' or upper(CONNECT_BY_MODEL_NAME) like '%HISENSE%' Then 'HISENSE'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%BRAVIA%' or upper(CONNECT_BY_MODEL_NAME) like '%BRAVIA%' Then 'SONY'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%PANASONIC%'  or upper(CONNECT_BY_MODEL_NAME) like '%PANASONIC%' Then 'PANASONIC'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%ROKU%' or upper(CONNECT_BY_MODEL_NAME) like '%ROKU%' Then 'ROKU'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%FIRE TV%' or upper(CONNECT_BY_MODEL_NAME) like '%FIRE TV%' Then 'FIRE TV'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%XBOX%' or upper(CONNECT_BY_MODEL_NAME) like '%XBOX%' Then 'XBOX'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%STICK%' or upper(CONNECT_BY_MODEL_NAME) like '%STICK%' Then 'ROKU'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%EXPRESS%' or upper(CONNECT_BY_MODEL_NAME) like '%EXPRESS%' Then 'ROKU'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) like '%HITACHI%' or upper(CONNECT_BY_MODEL_NAME) like '%HITACHI%' Then 'HITACHI'
+          WHEN upper(CONNECT_BY_FRIENDLY_NAME) is null or upper(CONNECT_BY_MODEL_NAME) is null Then null
+          else 'NOT SET' end as TV_Category,
+          COALESCE(Paid_user,"No") as Paid_Status,coalesce(e.user_id,major.user_pseudo_id) as matech_id
+From `analytics_332888339.events_*` major
+left join (Select distinct user_pseudo_id, string_agg(distinct param.value.string_value) as CONNECT_BY_FRIENDLY_NAME
+            FROM `analytics_332888339.events_*`, UNNEST(event_params) AS param
+            where param.key = 'CONNECT_BY_FRIENDLY_NAME'
+            group by user_pseudo_id) a using(user_pseudo_id)
+left join (Select distinct user_pseudo_id, string_agg(distinct param.value.string_value) as CONNECT_BY_MODEL_NAME
+            FROM `analytics_332888339.events_*`, UNNEST(event_params) AS param
+            where param.key = 'CONNECT_BY_MODEL_NAME'
+            group by user_pseudo_id) b using(user_pseudo_id)
+left join (Select distinct user_pseudo_id, string_agg(distinct param.value.string_value) as CONNECT_BY_SERVICE
+            FROM `analytics_332888339.events_*`, UNNEST(event_params) AS param
+            where param.key = 'CONNECT_BY_SERVICE'
+            group by user_pseudo_id) c using(user_pseudo_id)
+left join (select distinct user_pseudo_id,"Yes" as Paid_user
+            from `analytics_332888339.events_*`
+            where event_name like 'payment_success%') d using(user_pseudo_id)
+left join (Select distinct user_pseudo_id, param.value.string_value as user_id
+FROM `analytics_332888339.events_*`, unnest(event_params) as param
+where param.key = 'USER_ID') e using(user_pseudo_id)
+
+
+--Paid day
+with id as (Select distinct user_pseudo_id, event_date,event_timestamp, substring(param.value.string_value,30,20) as ID_IAP
+from `analytics_332888339.events_*`,unnest(event_params) as param
+where event_name like 'payment_success%' and param.key = 'ID_IAP'),
+tv_info as (Select distinct user_pseudo_id, param.value.string_value as SELECT_DEVICE_BRAND_NAME
+from `analytics_332888339.events_*`,unnest(event_params) as param
+where param.key = 'SELECT_DEVICE_BRAND_NAME'),
+model_name as (Select distinct user_pseudo_id, param.value.string_value as CONNECT_BY_MODEL_NAME
+from `analytics_332888339.events_*`,unnest(event_params) as param
+where param.key = 'CONNECT_BY_MODEL_NAME'),
+position_show as (Select distinct user_pseudo_id,event_date, param.value.string_value as POSITION_SHOW_IAP
+from `analytics_332888339.events_*`,unnest(event_params) as param
+where param.key = 'POSITION_SHOW_IAP')
+
+Select distinct user_pseudo_id,
+            a.event_date,online_date_count as paid_date,
+            POSITION_SHOW_IAP, ID_IAP ,
+             SELECT_DEVICE_BRAND_NAME,
+             CONNECT_BY_MODEL_NAME, 
+            language,operating_system_version,mobile_model_name ,
+            continent,country,
+            install_source,name,medium,source, matech_id,online_date_count
+From
+(select *,date_diff(date(PARSE_DATE('%Y%m%d', event_date)),date(TIMESTAMP_MICROS(first_touch)),DAY)+1 as online_date_count
+From (SELECT event_date,event_name, event_timestamp,user_pseudo_id,user_first_touch_timestamp,geo.continent,geo.country,device.language,device.operating_system_version,device.mobile_model_name,
+      app_info.install_source,traffic_source.name,traffic_source.medium,traffic_source.source,
+      coalesce(e.user_id,user_pseudo_id) as matech_id
+      From `analytics_332888339.events_*`
+      left join (Select distinct user_pseudo_id, param.value.string_value as user_id
+      FROM `analytics_332888339.events_*`, unnest(event_params) as param
+      where param.key = 'USER_ID') e using(user_pseudo_id))
+left join
+(Select distinct matech_id,min(user_first_touch_timestamp) as first_touch
+from
+(SELECT event_date,event_name, event_timestamp,user_pseudo_id,user_first_touch_timestamp,geo.continent,geo.country,coalesce(e.user_id,user_pseudo_id) as matech_id
+From `analytics_332888339.events_*`
+left join (Select distinct user_pseudo_id, param.value.string_value as user_id
+FROM `analytics_332888339.events_*`, unnest(event_params) as param
+where param.key = 'USER_ID') e using(user_pseudo_id))
+group by 1) using(matech_id)) a
+left join id using(user_pseudo_id, event_date,event_timestamp)
+left join tv_info using(user_pseudo_id)
+left join model_name using(user_pseudo_id)
+left join position_show  using(user_pseudo_id, event_date)
+where event_name like 'payment_success%'
+order by a.matech_id
+
+
+--free-trial
+
+
+with free_trial_t as (Select distinct user_pseudo_id,event_name, event_date, event_timestamp, param.value.int_value as free_trial
+FROM `remotetv-43875.analytics_332888339.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' and param.key ='free_trial'),
+validated_t as (Select distinct user_pseudo_id,event_name, event_date, event_timestamp, param.value.int_value as validated
+FROM `remotetv-43875.analytics_332888339.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' and param.key ='validated'),
+product_name_t as (Select distinct user_pseudo_id,event_name, event_date, event_timestamp, param.value.string_value as product_name
+FROM `remotetv-43875.analytics_332888339.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' and param.key ='product_name'),
+value_t as (Select distinct user_pseudo_id,event_name, event_date, event_timestamp, param.value.int_value as value
+FROM `remotetv-43875.analytics_332888339.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' and param.key ='value'),
+currency_t as (Select distinct user_pseudo_id,event_name, event_date, event_timestamp, param.value.int_value as currency
+FROM `remotetv-43875.analytics_332888339.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' and param.key ='currency')
+
+
+Select distinct matech_id,
+            a.event_date,online_date_count as paid_date,
+           free_trial,validated,product_name,
+            language,operating_system_version,mobile_model_name ,
+            continent,country,value,currency,
+            install_source,name,medium,source,online_date_count
+From
+(select *,date_diff(date(PARSE_DATE('%Y%m%d', event_date)),date(TIMESTAMP_MICROS(first_touch)),DAY)+1 as online_date_count
+From (SELECT event_date,event_name, event_timestamp,user_pseudo_id,user_first_touch_timestamp,geo.continent,geo.country,device.language,device.operating_system_version,device.mobile_model_name,
+      app_info.install_source,traffic_source.name,traffic_source.medium,traffic_source.source,
+      coalesce(e.user_id,user_pseudo_id) as matech_id
+      From `analytics_332888339.events_*`
+      left join (Select distinct user_pseudo_id, param.value.string_value as user_id
+      FROM `analytics_332888339.events_*`, unnest(event_params) as param
+      where param.key = 'USER_ID') e using(user_pseudo_id))
+left join
+(Select distinct matech_id,min(user_first_touch_timestamp) as first_touch
+from
+      (SELECT event_date,event_name, event_timestamp,user_pseudo_id,user_first_touch_timestamp,geo.continent,geo.country,coalesce(e.user_id,user_pseudo_id) as matech_id
+      From `analytics_332888339.events_*`
+            left join 
+                  (Select distinct user_pseudo_id, param.value.string_value as user_id
+                  FROM `analytics_332888339.events_*`, unnest(event_params) as param
+                  where param.key = 'USER_ID') e using(user_pseudo_id))
+                  group by 1) using(matech_id)) a
+left join free_trial_t using(user_pseudo_id,event_name, event_date, event_timestamp)
+left join validated_t using(user_pseudo_id,event_name, event_date, event_timestamp)
+left join product_name_t using(user_pseudo_id,event_name, event_date, event_timestamp)
+left join value_t using(user_pseudo_id,event_name, event_date, event_timestamp)
+left join currency_t using(user_pseudo_id,event_name, event_date, event_timestamp)
+left join (Select distinct user_pseudo_id, param.value.string_value as user_id
+FROM `analytics_332888339.events_*`, unnest(event_params) as param
+where param.key = 'USER_ID') e using(user_pseudo_id)
+where event_name = 'in_app_purchase'
+
+
+--last event /user
+Select *
+FROM (Select *, coalesce(id,user_pseudo_id) as matech_id
+            From `remotetv-43875.analytics_332888339.events_*`
+            left join
+                (Select Distinct user_pseudo_id, param2.value.string_value as id
+                FROM `remotetv-43875.analytics_332888339.events_*`,unnest(event_params) as param2
+                where param2.key = 'USER_ID') using (user_pseudo_id)) a
+left join
+    (SELECT distinct matech_id, max(event_timestamp) as event_timestamp,"yes" as last_event
+    From
+        (
+           Select *, coalesce(id,user_pseudo_id) as matech_id
+            From `remotetv-43875.analytics_332888339.events_*`
+            left join
+                (Select Distinct user_pseudo_id, param2.value.string_value as id
+                FROM `remotetv-43875.analytics_332888339.events_*`,unnest(event_params) as param2
+                where param2.key = 'USER_ID') using (user_pseudo_id)
+            where event_name not in('user_engagement','session_start','screen_view')
+        )
+    group by 1) b 
+    using(matech_id,event_timestamp) 
+order by matech_id
+
