@@ -1,0 +1,56 @@
+--TV/OS coding tìm tình trạng kết nối
+--12/05/2023
+with click_tv as (
+    SELECT distinct user_pseudo_id,version,country,event_date, event_timestamp,event_name,ga_session_id, CONNECT_BY_MODEL_NAME,
+            CONNECT_BY_FRIENDLY_NAME,
+            CONNECT_BY_SERVICE,tv_operating_system,
+            tv_brand, 
+            Case when event_name = 'switch_tv_cn' then  "SWITCH_TV"
+            else "CLICK_TV" end as type
+    FROM remotetv-43875.bi_event_ga_id.event_with_tv_theme_user_type
+, unnest(event_params) as param
+    where event_name in('click_tv_auto_ctd_cn','click_tv_ctd_cn','switch_tv_cn') and ga_session_id is not null
+    ),
+connect_result as (
+        SELECT distinct user_pseudo_id,version,country,event_date,event_timestamp ,substr(upper(event_name),18,27) as event_name, concat("CONNECT ",substr(upper(event_name),18,27)) as type,ga_session_id,tv_brand,tv_operating_system,
+                 CONNECT_BY_MODEL_NAME,
+                 CONNECT_BY_FRIENDLY_NAME,
+                CONNECT_BY_SERVICE,
+        FROM remotetv-43875.bi_event_ga_id.event_with_tv_theme_user_type
+, unnest(event_params) as param
+        where event_name in ('connection_event_success','connection_event_fail') and ga_session_id is not null
+        )
+,checklist as (
+Select distinct event_date,event_name,user_pseudo_id,event_timestamp,CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,type,ga_session_id,tv_brand,tv_operating_system,version,country
+from connect_result
+union all 
+Select distinct event_date,event_name,user_pseudo_id,event_timestamp,CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,type,ga_session_id,tv_brand,tv_operating_system,version,country
+from click_tv
+where ga_session_id is not null
+)
+
+--lấy kết quả event
+,dieukien as(
+  Select event_date,user_pseudo_id,version,event_timestamp,--đây là timestamp event success
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,tv_brand ,ga_session_id,lag_type as event_click,event_name,
+  Case when type = lag_type and type = 'CLICK_TV' then 'NO RESPONSE'
+  when lag_type in  ('CLICK_TV','SWITCH_TV') and type is null then "UNDEFINED" else type end as click_result,lag_event_timestamp,tv_operating_system,
+  timestamp_diff((event_timestamp),(lag_event_timestamp), second) as time_spend_by_second
+from
+(Select event_date,user_pseudo_id,event_timestamp,version,country,event_name,
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,tv_brand ,tv_operating_system,
+        type,ga_session_id,
+        lag(type) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_type,
+        lag(event_timestamp) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_event_timestamp,
+        lag(CONNECT_BY_FRIENDLY_NAME) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_CONNECT_BY_FRIENDLY_NAME,
+        lag(tv_brand) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_tv_brand
+from checklist)
+where lag_event_timestamp<=event_timestamp and CONNECT_BY_FRIENDLY_NAME = lag_CONNECT_BY_FRIENDLY_NAME and tv_brand = lag_tv_brand and upper(lag_type) like "%TV%" and upper(type) != 'SWITCH_TV')
+
+
+Select distinct event_date, ga_session_id, user_pseudo_id,time_spend_by_second,version,lag_event_timestamp as click_timestamp,click_result,event_click,tv_operating_system,
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE, tv_brand,
+        rank() over(partition by user_pseudo_id, event_date,ga_session_id,CONNECT_BY_FRIENDLY_NAME,tv_brand,event_click order by event_timestamp) as tv_connect_time
+From dieukien
+where ga_session_id is not null
+order by user_pseudo_id,event_date,click_timestamp
