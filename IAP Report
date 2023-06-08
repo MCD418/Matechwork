@@ -1,0 +1,317 @@
+--TCSM 
+with cte_fx as 
+(
+  select
+    date,
+    to_currency_code,
+    avg(value) as value
+  from `fivetran-379907.BigQuery.exchange_rate_exchange_rates`
+  group by
+    date,
+    to_currency_code 
+),
+bang as(
+SELECT  
+  cast(event_date as date) event_date,
+  app_apple_id,
+  app_name,
+  country,
+  subscription_name,
+  standard_subscription_duration,
+  subscription_offer_duration,
+  subscription_offer_type,
+  subscriber_id,units,
+  case 
+    when length(purchase_date)=10 then cast(purchase_date as date)
+    else null 
+  end as purchase_date,
+  refund,
+  customer_currency,
+  1/fx.value as to_USD_exchange_rate,
+  customer_price,
+  case
+      when customer_price > 0 then developer_proceeds
+      else -1*developer_proceeds
+  end as developer_proceeds,
+  case
+      when customer_price > 0 then developer_proceeds/fx.value
+      else -1*developer_proceeds/fx.value
+  end as developer_proceeds_USD
+FROM `fivetran-379907.itunes_connect.sales_subscriber_detailed` ssd
+LEFT OUTER JOIN cte_fx fx
+  on cast(ssd.event_date as date) = fx.date and ssd.customer_currency = fx.to_currency_code
+),
+
+ver as (SELECT distinct subscriber_id,
+      Case when min(event_date) between "2022-09-01" and "2022-10-22" then "1.0" 
+      when min(event_date) between "2022-10-21" and "2022-11-08" then "1.1" 
+      when min(event_date) between "2022-11-09" and "2022-11-28" then "1.2" 
+      when min(event_date) between "2022-11-29" and "2022-12-10" then "1.3" 
+      when min(event_date) between "2022-12-11" and "2022-12-21" then "1.3.1" 
+      when min(event_date) between "2022-12-22" and "2022-12-29" then "1.4" 
+      when min(event_date) between "2022-12-30" and "2023-01-19" then "1.5" 
+      when min(event_date) between "2023-01-20" and "2023-02-23" then "1.6" 
+      when min(event_date) between "2023-02-24" and "2023-03-17" then "1.7" 
+      when min(event_date) between "2023-03-18" and "2023-03-27" then "1.8" 
+      when min(event_date) < "2023-04-20" then "1.9"
+      when min(event_date) < "2023-05-11" then "2.0"
+      else "2.1"
+      end as version
+FROM bang
+where upper(app_name) like '%REMOTE%'
+group by 1)
+,done_1 as (
+  SELECT app_name,subscriber_id,event_date,purchase_date,subscription_offer_type,	units,country,
+developer_proceeds_USD
+  ,subscription_name,version,
+  case when developer_proceeds_USD <0 then null
+  when developer_proceeds_USD = 0 then date(event_date) + INTERVAL 3 DAY
+  when subscription_name like 'Week%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 7 DAY
+  when subscription_name like 'Monthly%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 1 MONTH
+  when subscription_name like 'Yearly%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 1 YEAR
+  when subscription_name like '3%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 3 MONTH
+  when subscription_name like '6%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 6 MONTH
+  else null
+  end as end_date
+  , lag(subscription_name) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_name
+FROM bang
+join ver using(subscriber_id)
+where upper(app_name) like '%REMOTE%' and subscriber_id is not null and subscriber_id <> ' '
+order by subscriber_id, event_date asc
+)
+,done_2 as (
+  Select *, lag(end_date) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_end_date,
+        lag(subscription_offer_type) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_offer_type
+  from done_1
+  )
+,normal as (
+Select distinct app_name,subscriber_id,date(event_date) as event_date,purchase_date,	units,country,
+developer_proceeds_USD,subscription_name,version,pre_subscription_end_date,pre_subscription_offer_type,
+      Case
+      when developer_proceeds_USD = 0 then "Free Trial"
+      when pre_subscription_offer_type = 'Free Trial' and date_diff(date(event_date),date(pre_subscription_end_date),day) between 0 and 60 then "Conversion to standard price"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) < 16 then "Renew"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) < 60 then "Renew From Billing Retry"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) >= 60 then "Reactivation"
+      else "Activation"
+      end as Event,
+      dense_rank() over(partition by subscriber_id,subscription_name order by event_date asc) as purchase_count
+from done_2
+where developer_proceeds_USD >= 0
+
+),
+refund_and_trial as (Select app_name,subscriber_id,date(event_date) as event_date,purchase_date,	units,country,
+developer_proceeds_USD,subscription_name,version,pre_subscription_end_date,pre_subscription_offer_type,
+        "Refund" as Event
+from done_2
+where developer_proceeds_USD < 0)
+
+,lifetime as (
+SELECT app_name, concat(title,country_code,version,subscription,begin_date) as subscriber_id,date(begin_date) as event_date,units, total_developer_proceeds_USD as developer_proceeds_USD,title as subscription_name,version,country_code as country,
+dense_rank() over(partition by concat(title,country_code,version,subscription,begin_date) order by date(begin_date) asc) as purchase_count,
+      case when total_developer_proceeds_USD >0 then "Activation" else "Refund" end as Event
+FROM `fivetran-379907.bi_mart.v_iap_sales_summary_daily_fx` --có lifetime
+where title = 'Lifetime' and upper(app_name) like "%REMOTE%")
+
+Select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version,Event,country,purchase_count
+from lifetime
+union all 
+select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version, Event,country,purchase_count
+from normal
+union all
+Select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version,Event,country, null as purchase_count
+from refund_and_trial
+---
+
+
+hiệu quả iap 
+WITH
+done1 as (Select *
+    From
+      `remotetv-43875.analytics_332888339.events_*`
+     where _TABLE_SUFFIX BETWEEN 
+  FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL 20 DAY)) AND
+  FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+  union all
+  Select *  
+  From `remotetv-43875.analytics_332888339.events_intraday_*`)
+,user_firebase as (
+  
+  Select distinct user_pseudo_id,
+    user_pro.key AS firebase_exp,
+    Case user_pro.value.string_value
+      WHEN "0" THEN "Baseline"
+      WHEN "1" THEN "Variant A"
+      WHEN "2" THEN "Variant B"
+      WHEN "3" THEN "Variant C"
+      WHEN "4" THEN "Variant D"
+      WHEN "5" THEN "Variant E"
+      WHEN "6" THEN "Variant F"
+      WHEN "7" THEN "Variant G"
+  END
+    AS Variant
+From 
+  (Select user_pseudo_id,user_pro
+ From
+      done1,
+    UNNEST(user_properties) AS user_pro
+where user_pro.key like 'firebase_exp_%'))
+ ,show_iap AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,--show_iap_timestamp,
+    event_name,
+    geo.country,
+    MAX(
+    IF
+      (param.key='inappstyle_id', param.value.string_value,NULL)) AS inappstyle_id,
+    MAX(
+    IF
+      (param.key='position', SUBSTRING(param.value.string_value,21,20),NULL)) AS position,
+  MAX(
+    IF
+      (param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id
+  FROM
+   done1,
+    UNNEST(event_params) AS param
+  WHERE
+    event_name in ('show_iap', 'close_iap')
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6),
+
+    --sửa lại phần kết quả thanh toán
+  payment_result AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    date_diff(date(timestamp_micros(event_timestamp)) ,date(TIMESTAMP_MICROS(user_first_touch_timestamp)),DAY)+1 as online_date_count,
+    TIMESTAMP_MICROS(event_timestamp) as event_timestamp,-- AS iap_result_timestamp,
+    event_name,
+    geo.country,
+    MAX( IF
+      (param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id,
+    MAX(
+    IF
+      (param.key='subscription_name'
+        OR param.key ='ID_IAP',param.value.string_value,NULL)) AS subscription_name,
+    upper(substr(event_name,length('payment_subcription_ '),100)) AS subscription_status,
+    MAX(
+    IF
+      (param.key='INAPPSTYLE', lower(param.value.string_value),NULL)) AS inappstyle_id,
+    max(if(param.key ='POSITION_SHOW_IAP',substr(param.value.string_value,length('position_show_inapp_ '),100),null)) AS position
+  FROM
+    done1,
+    UNNEST(event_params) AS param
+  WHERE
+    event_name in ('payment_subcription_success','payment_subcription_fail') 
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7)
+,checklist as(
+  Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+  From show_iap
+  where ga_session_id is not null
+  union all
+Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+From payment_result
+where ga_session_id is not null)
+,lead_next_event as(
+  Select *
+  From (Select user_pseudo_id,event_name as previous_event, version,ga_session_id, event_date,event_timestamp as pre_event_timestamp,country,inappstyle_id,position,
+      lead(event_name) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as event_name,
+      lead(event_timestamp) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as event_timestamp
+From checklist
+order by user_pseudo_id , pre_event_timestamp) where previous_event = 'show_iap' )
+
+Select *
+From (Select user_pseudo_id,previous_event,ga_session_id,case when event_name is null then 'Kill App' else event_name end as result, version, event_date,pre_event_timestamp as show_iap_timestamp, event_timestamp as result_timestamp,country,inappstyle_id,position,firebase_exp,timestamp_diff(event_timestamp,pre_event_timestamp,second) as result_time_count,
+Case when Variant is null then 'Not Test' else Variant end as Variant
+,trim(REplace(substr(upper(subscription_name),length('COM.SMARTTV.UNIVERSAL.REMOTE.'),length(subscription_name)),".",' ')) as Product_name,upper(subscription_status) as subscription_status,online_date_count,
+Row_number() over(partition by user_pseudo_id order by pre_event_timestamp asc) as iap_impression_count
+From lead_next_event
+left join payment_result using (user_pseudo_id,ga_session_id,event_name,version,event_date,event_timestamp,country,inappstyle_id,position)
+left join user_firebase using(user_pseudo_id))
+where result != 'show_iap'
+
+--ARPU
+
+
+with count_tv as
+(Select user_pseudo_id, version,country,tv_brand,count(*) as count_tv_usage
+From  `bi_event_ga_id.event_with_tv_theme_user_type`
+group by 1,2,3,4) 
+,tv_divert as
+(Select user_pseudo_id,version,country,count(distinct tv_brand) as diversity
+From count_tv group by 1,2,3)
+--nếu như kết nối với nhiều hơn 1 loại tv thì bỏ no data--
+,tv_not_no_data as (
+Select distinct user_pseudo_id, version,country,tv_brand,count_tv_usage
+From count_tv
+join
+(  Select user_pseudo_id,version, country, max(count_tv_usage) as count_tv_usage
+From count_tv join
+(Select user_pseudo_id, version, country
+from tv_divert
+where diversity>1) using(user_pseudo_id, version, country)
+where tv_brand <>'No Data'
+group by 1,2,3) using(user_pseudo_id,count_tv_usage,version, country)
+)
+--Chưa từng kết nối tv thành công
+,got_only_no_data as(
+  Select distinct user_pseudo_id,version,country,tv_brand, count_tv_usage 
+  from count_tv 
+  where user_pseudo_id in (Select distinct user_pseudo_id from tv_divert where diversity=1) and tv_brand = 'No Data'
+  )
+,all_user as
+(Select *
+From tv_not_no_data
+union all
+Select *
+From got_only_no_data )
+
+--loại tv được dùng nhiều nhất
+,most_used_tv as (
+  Select user_pseudo_id, version,country,count_tv.tv_brand as top_used_brand_of_user
+From count_tv 
+join all_user using(user_pseudo_id, version,country,count_tv_usage)
+)
+
+--người dùng đã mua
+,paying_user as (Select distinct user_pseudo_id,user_pseudo_id as paid_user, product_id
+From  `bi_event_ga_id.event_with_tv_theme_user_type`
+where event_value_in_usd is not null
+group by 1,3) 
+,new_user as (Select distinct user_pseudo_id,event_date,user_pseudo_id as new_user
+From  `bi_event_ga_id.event_with_tv_theme_user_type`
+where event_name = 'first_open') 
+,last_evolution as(
+  Select distinct event_date,user_pseudo_id,paid_user, top_used_brand_of_user,version,country,event_value_in_usd,paying_user.product_id,new_user.new_user
+From  `bi_event_ga_id.event_with_tv_theme_user_type`
+left join most_used_tv b using (user_pseudo_id,version,country)
+left join paying_user using(user_pseudo_id)
+left join new_user using(user_pseudo_id, event_date)
+)
+--,last_evolution_2 as (
+  Select *,case when new_user is not null and paid_user is not null then user_pseudo_id else null end as new_paying_user
+From last_evolution
+--)
+
+
+/*
+Select event_date, version, country, top_used_brand_of_user,product_id,sum(event_value_in_usd) as revenue, count(distinct user_pseudo_id) as user_count, count(distinct paid_user) as paying_user_count, 
+count(distinct new_user) as new_user_count, count( distinct new_paying_user) as new_paying_user_count
+From last_evolution_2
+group by 1,2,3,4,5*/
